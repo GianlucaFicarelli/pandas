@@ -28,6 +28,7 @@ from pandas._libs import (
     lib,
 )
 from pandas._libs.hashtable import duplicated
+from pandas._libs.missing import checknull
 from pandas._typing import (
     AnyAll,
     AnyArrayLike,
@@ -123,7 +124,177 @@ _index_doc_kwargs.update(
 )
 
 
-class MultiIndexUInt64Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt64Engine):
+# Defines shift of MultiIndex codes to avoid negative codes (missing values)
+multiindex_nulls_shift = 2
+
+
+class BaseMultiIndexCodesEngine:
+    """
+    Base class for MultiIndexUIntEngine and MultiIndexPyIntEngine, which
+    represent each label in a MultiIndex as an integer, by juxtaposing the bits
+    encoding each level, with appropriate offsets.
+
+    For instance: if 3 levels have respectively 3, 6 and 1 possible values,
+    then their labels can be represented using respectively 2, 3 and 1 bits,
+    as follows:
+     _ _ _ _____ _ __ __ __
+    |0|0|0| ... |0| 0|a1|a0| -> offset 0 (first level)
+     — — — ————— — —— —— ——
+    |0|0|0| ... |0|b2|b1|b0| -> offset 2 (bits required for first level)
+     — — — ————— — —— —— ——
+    |0|0|0| ... |0| 0| 0|c0| -> offset 5 (bits required for first two levels)
+     ‾ ‾ ‾ ‾‾‾‾‾ ‾ ‾‾ ‾‾ ‾‾
+    and the resulting unsigned integer representation will be:
+     _ _ _ _____ _ __ __ __ __ __ __
+    |0|0|0| ... |0|c0|b2|b1|b0|a1|a0|
+     ‾ ‾ ‾ ‾‾‾‾‾ ‾ ‾‾ ‾‾ ‾‾ ‾‾ ‾‾ ‾‾
+
+    Offsets are calculated at initialization, labels are transformed by method
+    _codes_to_ints.
+
+    Keys are located by first locating each component against the respective
+    level, then locating (the integer representation of) codes.
+    """
+    def __init__(self, levels, labels, offsets):
+        """
+        Parameters
+        ----------
+        levels : list-like of numpy arrays
+            Levels of the MultiIndex.
+        labels : list-like of numpy arrays of integer dtype
+            Labels of the MultiIndex.
+        offsets : numpy array of int dtype
+            Pre-calculated offsets, one for each level of the index.
+        """
+        self.levels = levels
+        self.offsets = offsets
+
+        # Transform labels in a single array, and add 2 so that we are working
+        # with positive integers (-1 for NaN becomes 1). This enables us to
+        # differentiate between values that are missing in other and matching
+        # NaNs. We will set values that are not found to 0 later:
+        codes = np.array(labels).T
+        codes += multiindex_nulls_shift  # inplace sum optimisation
+
+        self.level_has_nans = [-1 in lab for lab in labels]
+
+        # Map each codes combination in the index to an integer unambiguously
+        # (no collisions possible), based on the "offsets", which describe the
+        # number of bits to switch labels for each level:
+        codes = self._codes_to_ints(codes)
+
+        # Initialize underlying index (e.g. libindex.UInt64Engine) with
+        # integers representing labels: we will use its get_loc and get_indexer
+        self._base.__init__(self, codes)
+
+    def _codes_to_ints(self, codes) -> np.ndarray:
+        """
+        Transform combination(s) of uint in one uint or Python integer (each), in a
+        strictly monotonic way (i.e. respecting the lexicographic order of integer
+        combinations).
+
+        Parameters
+        ----------
+        codes : 1- or 2-dimensional array of dtype uint
+            Combinations of integers (one per row)
+
+        Returns
+        -------
+        scalar or 1-dimensional array, of dtype _codes_dtype
+            Integer(s) representing one combination (each).
+        """
+        # To avoid overflows, first make sure we are working with the right dtype:
+        codes = codes.astype(self._codes_dtype, copy=False)
+
+        # Shift the representation of each level by the pre-calculated number of bits:
+        codes <<= self.offsets  # inplace shift optimisation
+
+        # Now sum and OR are in fact interchangeable. This is a simple
+        # composition of the (disjunct) significant bits of each level (i.e.
+        # each column in "codes") in a single positive integer (per row):
+        if codes.ndim == 1:
+            # Single key
+            return np.bitwise_or.reduce(codes)
+
+        # Multiple keys
+        return np.bitwise_or.reduce(codes, axis=1)
+
+    def _extract_level_codes(self, target) -> np.ndarray:
+        """
+        Map the requested list of (tuple) keys to their integer representations
+        for searching in the underlying integer index.
+
+        Parameters
+        ----------
+        target : MultiIndex
+
+        Returns
+        ------
+        int_keys : 1-dimensional array of dtype uint64 or object
+            Integers representing one combination each
+        """
+        level_codes = list(target._recode_for_new_levels(self.levels))
+        for i, codes in enumerate(level_codes):
+            if self.levels[i].hasnans:
+                na_index = self.levels[i].isna().nonzero()[0][0]
+                codes[target.codes[i] == -1] = na_index
+            codes += 1
+            codes[codes > 0] += 1
+            if self.level_has_nans[i]:
+                codes[target.codes[i] == -1] += 1
+        return self._codes_to_ints(np.array(level_codes, dtype=self._codes_dtype).T)
+
+    def get_indexer(self, target: np.ndarray) -> np.ndarray:
+        """
+        Returns an array giving the positions of each value of `target` in
+        `self.values`, where -1 represents a value in `target` which does not
+        appear in `self.values`
+
+        Parameters
+        ----------
+        target : np.ndarray
+
+        Returns
+        -------
+        np.ndarray[intp_t, ndim=1] of the indexer of `target` into
+        `self.values`
+        """
+        return self._base.get_indexer(self, target)
+
+    def get_loc(self, key):
+        if libindex.is_definitely_invalid_key(key):
+            raise TypeError(f"'{key}' is an invalid key")
+        if not isinstance(key, tuple):
+            raise KeyError(key)
+        try:
+            indices = [1 if checknull(v) else lev.get_loc(v) + multiindex_nulls_shift
+                       for lev, v in zip(self.levels, key)]
+        except KeyError:
+            raise KeyError(key)
+
+        # Transform indices into single integer:
+        lab_int = self._codes_to_ints(np.array(indices, dtype=self._codes_dtype))
+
+        return self._base.get_loc(self, lab_int)
+
+    def get_indexer_non_unique(self, target: np.ndarray) -> np.ndarray:
+        indexer = self._base.get_indexer_non_unique(self, target)
+
+        return indexer
+
+    def __contains__(self, val: object) -> bool:
+        # We assume before we get here:
+        #  - val is hashable
+        # Default __contains__ looks in the underlying mapping, which in this
+        # case only contains integer representations.
+        try:
+            self.get_loc(val)
+            return True
+        except (KeyError, TypeError, ValueError):
+            return False
+
+
+class MultiIndexUInt64Engine(BaseMultiIndexCodesEngine, libindex.UInt64Engine):
     """Manages a MultiIndex by mapping label combinations to positive integers.
 
     The number of possible label combinations must not overflow the 64 bits integers.
@@ -133,7 +304,7 @@ class MultiIndexUInt64Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt64
     _codes_dtype = "uint64"
 
 
-class MultiIndexUInt32Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt32Engine):
+class MultiIndexUInt32Engine(BaseMultiIndexCodesEngine, libindex.UInt32Engine):
     """Manages a MultiIndex by mapping label combinations to positive integers.
 
     The number of possible label combinations must not overflow the 32 bits integers.
@@ -143,7 +314,7 @@ class MultiIndexUInt32Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt32
     _codes_dtype = "uint32"
 
 
-class MultiIndexUInt16Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt16Engine):
+class MultiIndexUInt16Engine(BaseMultiIndexCodesEngine, libindex.UInt16Engine):
     """Manages a MultiIndex by mapping label combinations to positive integers.
 
     The number of possible label combinations must not overflow the 16 bits integers.
@@ -153,7 +324,7 @@ class MultiIndexUInt16Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt16
     _codes_dtype = "uint16"
 
 
-class MultiIndexUInt8Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt8Engine):
+class MultiIndexUInt8Engine(BaseMultiIndexCodesEngine, libindex.UInt8Engine):
     """Manages a MultiIndex by mapping label combinations to positive integers.
 
     The number of possible label combinations must not overflow the 8 bits integers.
@@ -163,7 +334,7 @@ class MultiIndexUInt8Engine(libindex.BaseMultiIndexCodesEngine, libindex.UInt8En
     _codes_dtype = "uint8"
 
 
-class MultiIndexPyIntEngine(libindex.BaseMultiIndexCodesEngine, libindex.ObjectEngine):
+class MultiIndexPyIntEngine(BaseMultiIndexCodesEngine, libindex.ObjectEngine):
     """Manages a MultiIndex by mapping label combinations to positive integers.
 
     This class manages those (extreme) cases in which the number of possible
@@ -1189,7 +1360,7 @@ class MultiIndex(Index):
         # calculating the indexer are shifted to 0
         sizes = np.ceil(
             np.log2(
-                [len(level) + libindex.multiindex_nulls_shift for level in self.levels]
+                [len(level) + multiindex_nulls_shift for level in self.levels]
             )
         )
 

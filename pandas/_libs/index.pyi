@@ -8,7 +8,7 @@ from pandas import (
 )
 from pandas.core.arrays import ExtensionArray
 
-multiindex_nulls_shift: int
+def is_definitely_invalid_key(val: object) -> bool: ...
 
 class IndexEngine:
     over_size_threshold: bool
